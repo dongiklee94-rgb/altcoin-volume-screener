@@ -1,0 +1,20 @@
+# API 키가 들어있는 파일 - 절대 커밋 금지
+.env
+*.env
+
+# 스크리너 상태 파일 (GitHub Actions 캐시로 관리되므로 커밋 불필요)
+volume_history.json
+alert_log.json
+state/
+
+# 파이썬
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# 에디터
+.vscode/
+.idea/
+.DS_Store
