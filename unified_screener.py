@@ -8,8 +8,8 @@
                - 평소 대비 거래량이 튀었는가 (RVOL) + 회전율
                - 방향성 없음. 오르든 내리든 "뭔가 일어나는 중"인 코인을 잡는다.
 
-  B (갓물주) : 바이낸스 선물 기준 "진입 후보" 스코어링
-               - 갓물주 스크리너 명세서 v1.0 그대로 구현
+  B (갓물주) : 바이낸스 현물 기준 "진입 후보" 스코어링
+               - 갓물주 스크리너 명세서 v1.0의 6개 조건을 그대로 구현
                - 6개 조건 충족 개수를 점수로 매긴다. 이미 상승을 시작한 저가 알트를 찾는다.
 
   C          : A와 B 양쪽에 동시에 걸린 종목
@@ -24,7 +24,21 @@
 
 --- 데이터 소스 ---
   A: CoinGecko API (API 키 필요) - 24시간 누적 스냅샷
-  B: Binance USDT-M Futures 공개 API (API 키 불필요) - 1시간봉/4시간봉 캔들
+  B: Binance 현물 공개 미러 data-api.binance.vision (API 키 불필요) - 1시간봉/4시간봉 캔들
+
+⚠️ B의 데이터 소스가 명세서와 다르다
+   명세서는 바이낸스 USDT 무기한선물(fapi.binance.com)을 지정했으나, GitHub Actions
+   러너에서 해당 도메인이 451(지역 차단)을 반환한다. 현물 API(api.binance.com)도 동일하게
+   차단되어, 인증·지역 제한이 없는 공개 데이터 미러를 사용한다.
+
+   그 결과:
+   - 종목 구성이 다르다 (선물에만 상장된 코인이 빠지고, 현물에만 있는 코인이 들어온다)
+   - 거래대금 규모가 선물보다 작다 (임계값 조정이 필요할 수 있다)
+   - 가격은 거의 동일하다 (실측 차이 0.1% 내외). 조건 ②③④⑥은 사실상 같은 값이 나온다
+   - 조건 ①(1H 거래량 배율)과 유동성 필터는 선물 기준과 달라진다
+
+   명세서에서 집중배율이 가장 높았던 것이 하필 거래량 조건(19.6배)이므로,
+   명세서의 통계 수치가 그대로 재현된다고 기대해서는 안 된다.
 
 --- 필요한 환경변수 ---
   TELEGRAM_BOT_TOKEN      (필수)
@@ -107,10 +121,18 @@ STABLECOIN_SYMBOLS = {
 
 
 # ==================== B: 갓물주 명세서 설정 ====================
-# 아래 임계값은 명세서 3장의 값 그대로다. 바꾸면 명세서 8장 검증값이 안 맞을 수 있다.
+# 조건 임계값은 명세서 3장 그대로다.
+#
+# ⚠️ 데이터 소스가 명세서와 다르다.
+#    명세서는 바이낸스 USDT 무기한선물 기준인데, GitHub Actions에서 선물 API가
+#    451 지역 차단을 받아 현물 공개 미러를 쓴다. 종목 구성과 거래대금 규모가 다르므로
+#    명세서의 통계 수치(집중배율 8.8배 등)가 그대로 재현된다고 볼 수 없다.
+#    조건 자체는 상식적이라 후보 선별에는 여전히 쓸 만하지만, 검증된 성능이 아니라
+#    참고 기준으로 봐야 한다.
 
 B_MAX_PRICE_USDT = 1.0                # 명세서 1장: 현재가 1달러 미만
-B_MIN_24H_QUOTE_VOLUME = 2_000_000    # 명세서 1장: 24시간 거래대금 200만 USDT 이상
+# 현물 1달러 미만 종목 분포 (진단 결과): 전체 496개 / $1M↑ 165개 / $2M↑ 100개 / $5M↑ 52개
+B_MIN_24H_QUOTE_VOLUME = 2_000_000    # 명세서 1장 값. 유니버스가 너무 좁으면 낮출 것
 B_SCORE_CUTOFF = 4                    # 명세서 4장 권장 기본값
 B_STRONG_SIGNAL_VOLX1 = 3.0           # 명세서 4장: 1H 거래량 3배 이상이면 "강신호" 태그
 B_TOP_N = 15
@@ -150,7 +172,7 @@ ALERT_LOG_PATH = os.path.join(STATE_DIR, "alert_log.json")
 
 CG_BASE_URL = "https://api.coingecko.com/api/v3"
 CMC_BASE_URL = "https://pro-api.coinmarketcap.com/v1"
-BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
+BINANCE_API = "https://data-api.binance.vision/api/v3"
 
 HTTP_TIMEOUT = 20
 
@@ -402,7 +424,7 @@ def binance_get(path, params=None):
     last_err = None
     for attempt in range(B_RETRY_COUNT):
         try:
-            resp = requests.get(f"{BINANCE_FAPI}{path}", params=params, timeout=HTTP_TIMEOUT)
+            resp = requests.get(f"{BINANCE_API}{path}", params=params, timeout=HTTP_TIMEOUT)
             if resp.status_code in (429, 418):
                 wait = B_RETRY_BACKOFF_SEC * (2 ** attempt)
                 print(f"[경고] 레이트리밋({resp.status_code}), {wait:.0f}초 대기 후 재시도")
@@ -420,17 +442,31 @@ def binance_get(path, params=None):
 
 def binance_get_universe():
     """
-    명세서 1장의 유니버스를 구성한다.
-    USDT 무기한선물 / TRADING 상태 / 가격 1달러 미만 / 24h 거래대금 200만 USDT 이상.
+    유니버스를 구성한다.
+
+    명세서 1장은 'USDT 무기한선물'을 대상으로 했으나, GitHub Actions에서 바이낸스 선물
+    API(fapi)가 451 지역 차단을 반환하기 때문에 현물 공개 미러(data-api.binance.vision)를
+    사용한다. 따라서 종목 구성과 거래대금 규모가 명세서 원본과 다르다는 점을 감안해야 한다.
+    (가격 자체는 선물과 거의 동일하므로 조건 ②③④⑥은 큰 차이가 없다)
+
+    조건: USDT 마켓 / TRADING 상태 / 가격 1달러 미만 / 24h 거래대금 기준치 이상
     """
     info = binance_get("/exchangeInfo")
     eligible = set()
     for s in info.get("symbols", []):
-        if (s.get("contractType") == "PERPETUAL"
-                and s.get("status") == "TRADING"
-                and s.get("quoteAsset") == "USDT"
-                and not s.get("symbol", "").startswith("BTCDOM")):
-            eligible.add(s["symbol"])
+        sym = s.get("symbol", "")
+        base = s.get("baseAsset", "")
+        if s.get("status") != "TRADING":
+            continue
+        if s.get("quoteAsset") != "USDT":
+            continue
+        # 현물에는 스테이블코인 페어와 레버리지 토큰이 섞여 있으므로 걸러낸다.
+        if base in STABLECOIN_SYMBOLS or base in ("BTC", "ETH"):
+            continue
+        # 레버리지 토큰: BTCUP/BTCDOWN, ETHBULL/ETHBEAR 등
+        if any(base.endswith(suf) for suf in ("UP", "DOWN", "BULL", "BEAR")):
+            continue
+        eligible.add(sym)
 
     tickers = binance_get("/ticker/24hr")
     universe = []
