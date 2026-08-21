@@ -234,8 +234,23 @@ def save_history(history):
 
 
 def save_alert_log(alert_log):
+    """
+    오래된 알림 기록을 정리하고 저장한다.
+
+    기록 형식은 {"ts": ISO시각, "score": 점수 or None} 인데, 구버전에서는 시각 문자열만
+    저장했기 때문에 두 형식이 섞여 있을 수 있다. 양쪽 다 처리한다.
+    """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=ALERT_COOLDOWN_HOURS * 2)).isoformat()
-    save_json_file(ALERT_LOG_PATH, {s: ts for s, ts in alert_log.items() if ts >= cutoff})
+
+    def entry_ts(entry):
+        if isinstance(entry, dict):
+            return entry.get("ts", "")
+        if isinstance(entry, str):
+            return entry
+        return ""
+
+    trimmed = {s: e for s, e in alert_log.items() if entry_ts(e) >= cutoff}
+    save_json_file(ALERT_LOG_PATH, trimmed)
 
 
 def is_in_cooldown(alert_log, symbol, current_score=None):
@@ -839,6 +854,38 @@ def self_test():
         failures.append("테스트6: 쿨다운 로직 오류")
     else:
         print("✅ 테스트6 통과")
+
+    # --- 테스트 6b: 알림 기록 저장 (dict/str 혼재 처리) ---
+    # 실제로 여기서 TypeError가 났었다. 구버전 문자열 형식과 신버전 dict 형식이 섞이면
+    # 정리 과정에서 비교가 깨진다.
+    print("\n테스트6b: 알림 기록 저장 (형식 혼재)")
+    import tempfile
+    global ALERT_LOG_PATH
+    orig_path = ALERT_LOG_PATH
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            ALERT_LOG_PATH = os.path.join(td, "alert_log.json")
+            old_ts = (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat()
+            mixed = {
+                "NEWFMT": {"ts": now, "score": 5},      # 신버전, 최신
+                "OLDFMT": now,                           # 구버전 문자열, 최신
+                "EXPIRED": {"ts": old_ts, "score": 3},   # 신버전, 만료
+                "BROKEN": None,                          # 깨진 값
+            }
+            save_alert_log(mixed)
+            saved = load_json_file(ALERT_LOG_PATH, {})
+            print(f"   저장된 키: {sorted(saved.keys())}")
+            ok = ("NEWFMT" in saved and "OLDFMT" in saved
+                  and "EXPIRED" not in saved and "BROKEN" not in saved)
+            if ok:
+                print("   ✅ 테스트6b 통과 (혼재 형식 처리, 만료 정리, 깨진 값 제거)")
+            else:
+                failures.append("테스트6b: 알림 기록 저장 처리 오류")
+    except Exception as e:
+        failures.append(f"테스트6b: 예외 발생 {type(e).__name__}: {e}")
+        print(f"   ❌ 예외: {e}")
+    finally:
+        ALERT_LOG_PATH = orig_path
 
     # --- 테스트 7: A/B/C 병합 ---
     print("\n테스트7: A/B/C 병합")
