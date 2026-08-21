@@ -682,27 +682,35 @@ def record_alerts(alert_log, group_c, group_b, group_a):
 
 # ==================== 메시지 ====================
 
+def short_symbol(sym):
+    """'XPLUSDT' -> 'XPL'. 한 줄 표시에서 USDT 접미사는 군더더기라 뗀다."""
+    return sym[:-4] if sym.endswith("USDT") else sym
+
+
 def fmt_b_line(b):
+    """
+    종목당 한 줄로 압축한다.
+    표시 지표는 핵심 3개만: 1H 거래량 배율(V), 24시간 수익률, MA20 이격도.
+    나머지(4H 수익률, 연속상승봉, 저점대비)는 점수에는 반영되지만 화면에는 안 띄운다.
+    """
     d = b["detail"]
-    tag = f" [{b['tag']}]" if b.get("tag") else ""
+    fire = "🔥" if b.get("tag") else ""
     return (
-        f"<b>{b['symbol']}</b>  {b['score']}/6점{tag}\n"
-        f"   {fmt_price(b['price'])}\n"
-        f"   1H거래량 {d['volX1']['value']:.2f}배 · "
-        f"24H {d['r24']['value']:+.1f}% · 4H {d['r4']['value']:+.1f}%\n"
-        f"   MA20 {d['dev20']['value']:+.1f}% · "
-        f"연속상승 {int(d['upBars']['value'])}봉 · "
-        f"저점대비 {d['fromLo30']['value']:+.1f}%"
+        f"<b>{b['score']}점</b>{fire} <b>{short_symbol(b['symbol'])}</b> · "
+        f"V{d['volX1']['value']:.1f} · "
+        f"24H{d['r24']['value']:+.0f}% · "
+        f"MA{d['dev20']['value']:+.0f}%"
     )
 
 
 def fmt_a_line(a):
+    """A도 한 줄로. 거래량 배율(RVOL)과 회전율만 보여준다."""
+    warn = "" if a.get("check_label", "").startswith("✅") else " ⚠️"
     return (
-        f"<b>{a['symbol']}</b> ({a['name']})\n"
-        f"   거래량 {fmt_usd(a['total_vol'])} "
-        f"(현물 {fmt_usd(a['spot_vol'])} · 선물 {fmt_usd(a['deriv_vol'])})\n"
-        f"   RVOL {a['rvol']:.1f}배 · 회전율 {a['turnover']*100:.1f}%\n"
-        f"   {a['check_label']}"
+        f"<b>{a['symbol']}</b> · "
+        f"RVOL{a['rvol']:.1f} · "
+        f"회전{a['turnover']*100:.0f}% · "
+        f"{fmt_usd(a['total_vol'])}{warn}"
     )
 
 
@@ -713,39 +721,38 @@ def build_message(group_c, group_b, group_a, a_enabled, a_ready):
     lines = [f"📊 <b>알트 스크리너</b> ({now_kst} KST)\n"]
 
     if group_c:
-        lines.append(f"🔴 <b>C · 양쪽 충족</b>  {len(group_c)}개")
-        for i, g in enumerate(group_c, 1):
-            a, b = g["a"], g["b"]
+        lines.append(f"🔴 <b>C · 양쪽 충족</b> {len(group_c)}")
+        for g in group_c:
+            a = g["a"]
             lines.append(
-                f"{i}. " + fmt_b_line(b) + "\n"
-                f"   └ RVOL {a['rvol']:.1f}배 · 회전율 {a['turnover']*100:.1f}%"
+                fmt_b_line(g["b"]) + f" · RVOL{a['rvol']:.1f}"
             )
         lines.append("")
 
     if group_b:
-        lines.append(f"🎯 <b>B · 진입 후보</b>  {len(group_b)}개")
-        for i, g in enumerate(group_b, 1):
-            lines.append(f"{i}. " + fmt_b_line(g["b"]))
+        lines.append(f"🎯 <b>B · 진입 후보</b> {len(group_b)}")
+        for g in group_b:
+            lines.append(fmt_b_line(g["b"]))
         lines.append("")
 
     if group_a:
-        lines.append(f"🚨 <b>A · 거래량 급등</b>  {len(group_a)}개")
-        for i, g in enumerate(group_a, 1):
-            lines.append(f"{i}. " + fmt_a_line(g["a"]))
+        lines.append(f"🚨 <b>A · 거래량 급등</b> {len(group_a)}")
+        for g in group_a:
+            lines.append(fmt_a_line(g["a"]))
         lines.append("")
 
     if total == 0:
         lines.append("조건에 맞는 신규 종목이 없습니다.")
 
-    if a_enabled and not a_ready:
-        lines.append(f"<i>ℹ️ A는 데이터 축적 중입니다 (스냅샷 {a_ready}개 확보, "
-                     f"{A_MIN_HISTORY_SNAPSHOTS}개 필요).</i>")
+    # A는 스냅샷이 일정 개수 쌓여야 판단을 시작한다. 그전까지는 안내를 띄운다.
+    if a_enabled and a_ready < A_MIN_HISTORY_SNAPSHOTS:
+        remaining = A_MIN_HISTORY_SNAPSHOTS - a_ready
+        lines.append(f"<i>ℹ️ A 준비중 · 스냅샷 {a_ready}/{A_MIN_HISTORY_SNAPSHOTS} "
+                     f"(약 {remaining}시간 뒤 작동)</i>")
 
     lines.append(
-        "\n<i>A = 코인게코 거래량 급등(RVOL·회전율) · "
-        "B = 바이낸스 진입 후보 6점 만점 · C = 양쪽 동시 충족\n"
-        f"같은 종목은 {ALERT_COOLDOWN_HOURS}시간 내 재알림하지 않습니다(점수 상승 시 예외).\n"
-        "⚠️ 후보 목록일 뿐 매수 신호가 아닙니다. 차트를 직접 확인하세요.</i>"
+        "<i>V=1H거래량배율 · MA=MA20이격 · 🔥=거래량 3배↑\n"
+        f"{ALERT_COOLDOWN_HOURS}시간 내 중복 알림 없음 · 매수 신호 아님</i>"
     )
     return "\n".join(lines)
 
