@@ -109,7 +109,13 @@ A_RVOL_LOOKBACK_HOURS = 168           # 7일치 = 168시간
 A_RVOL_MULTIPLIER_THRESHOLD = 2.0     # 평소 대비 2배 이상
 A_MIN_HISTORY_SNAPSHOTS = 12          # 이만큼 스냅샷이 쌓여야 RVOL 판단 시작
 A_TURNOVER_RATIO_THRESHOLD = 0.30     # 회전율(현물 거래량/시총) 30% 이상
-A_TOP_N = 15
+A_TOP_N = 15                          # 알림에 올리는 A 단독 종목 최대 개수
+
+# A 강도 점수 (3점 만점). 위 기본 조건을 통과하면 1점, 아래를 넘을 때마다 +1점.
+# 메시지에는 A 단독 종목 중 이 점수가 A_SHOW_MIN_SCORE 이상인 것만 올린다.
+A_STRONG_RVOL = 5.0                   # +1점: 평소 대비 5배 이상 (거래량 폭증)
+A_STRONG_TURNOVER = 1.0               # +1점: 회전율 100% 이상 (시총만큼 손바뀜)
+A_SHOW_MIN_SCORE = 3                  # A 단독은 3점(최고점)만 알림
 
 CROSS_CHECK_DISCREPANCY_THRESHOLD = 0.30  # 코인게코 vs CMC 오차 허용치
 
@@ -133,7 +139,7 @@ STABLECOIN_SYMBOLS = {
 B_MAX_PRICE_USDT = 1.0                # 명세서 1장: 현재가 1달러 미만
 # 현물 1달러 미만 종목 분포 (진단 결과): 전체 496개 / $1M↑ 165개 / $2M↑ 100개 / $5M↑ 52개
 B_MIN_24H_QUOTE_VOLUME = 2_000_000    # 명세서 1장 값. 유니버스가 너무 좁으면 낮출 것
-B_SCORE_CUTOFF = 4                    # 명세서 4장 권장 기본값
+B_SCORE_CUTOFF = 6                    # 6개 조건을 모두 충족한 종목만 알림 (명세서 권장 기본값은 4)
 B_STRONG_SIGNAL_VOLX1 = 3.0           # 명세서 4장: 1H 거래량 3배 이상이면 "강신호" 태그
 B_TOP_N = 15
 
@@ -366,6 +372,11 @@ def cross_check_label(cg_vol, cmc_vol):
     return f"⚠️ 확인필요 (CMC {fmt_usd(cmc_vol)})"
 
 
+def a_score(rvol, turnover):
+    """A 기본 조건을 통과한 종목의 강도 점수 (1~3점)."""
+    return 1 + int(rvol >= A_STRONG_RVOL) + int(turnover >= A_STRONG_TURNOVER)
+
+
 def run_screener_a(history):
     """
     A: 코인게코 기준 거래량 급등 감지.
@@ -417,13 +428,15 @@ def run_screener_a(history):
             "total_vol": total_vol,
             "rvol": rvol,
             "turnover": turnover,
+            "a_score": a_score(rvol, turnover),
         })
 
     # 이번 스냅샷 기록 (다음 실행의 RVOL 재료)
     history[datetime.now(timezone.utc).strftime("%Y-%m-%d %H")] = snapshot
 
+    # 여기서 자르지 않는다. B 6점 종목과의 교집합(🔥)은 A 통과 종목 전체와 대조해야
+    # 하기 때문이다. 알림에 올릴 A 단독 개수 제한(A_TOP_N)은 merge_results에서 적용한다.
     passed.sort(key=lambda x: x["rvol"], reverse=True)
-    passed = passed[:A_TOP_N]
 
     cmc = cmc_get_volumes()
     for r in passed:
@@ -632,52 +645,69 @@ def run_screener_b():
     return passed[:B_TOP_N], len(universe)
 
 
-# ==================== 결과 병합 (A / B / C) ====================
+# ==================== 결과 병합 ====================
+#
+# 알림에 올라가는 종목은 세 종류이고, 이 순서로 표시한다.
+#   🔥 group_c : B 6점 + A 통과 (A 점수 1~3 상관없이)   = 양쪽 충족
+#   🐋 group_b : B 6점 (A에는 안 걸림)
+#   🐋 group_a : A 3점 (B 6점이 아님)
+# A 1~2점 단독, B 5점 이하는 알리지 않는다.
+#
+# 쿨다운 기록에 남기는 등급 점수: 🔥=7, B 6점=6, A 3점 단독=0
+# is_in_cooldown은 "점수가 오르면 재알림"이므로, 12시간 안에 🐋가 🔥로 올라가거나
+# A 단독이 B 6점이 되면 다시 알린다.
+RANK_FIRE, RANK_B6, RANK_A3 = 7, 6, 0
+
 
 def merge_results(a_list, b_list, alert_log):
     """
-    A와 B 결과를 합쳐 C(교집합)를 판정하고, 쿨다운을 적용한다.
+    A와 B 결과를 합쳐 🔥/🐋 그룹을 나누고 쿨다운을 적용한다.
     A는 코인게코 심볼('ACT'), B는 바이낸스 심볼('ACTUSDT')이므로 base 기준으로 대조한다.
     """
     a_by_base = {r["symbol"]: r for r in a_list}
-    b_by_base = {base_symbol(r["symbol"]): r for r in b_list}
+    b_by_base = {base_symbol(r["symbol"]): r for r in b_list
+                 if r["score"] >= B_SCORE_CUTOFF}
     both = set(a_by_base) & set(b_by_base)
 
     group_c, group_b, group_a = [], [], []
 
     for base in both:
-        b = b_by_base[base]
-        if is_in_cooldown(alert_log, base, b["score"]):
+        if is_in_cooldown(alert_log, base, RANK_FIRE):
             continue
-        group_c.append({"base": base, "a": a_by_base[base], "b": b})
+        group_c.append({"base": base, "a": a_by_base[base], "b": b_by_base[base]})
 
     for base, b in b_by_base.items():
         if base in both:
             continue
-        if is_in_cooldown(alert_log, base, b["score"]):
+        if is_in_cooldown(alert_log, base, RANK_B6):
             continue
         group_b.append({"base": base, "b": b})
 
     for base, a in a_by_base.items():
         if base in both:
             continue
-        if is_in_cooldown(alert_log, base):
+        if a.get("a_score", a_score(a["rvol"], a["turnover"])) < A_SHOW_MIN_SCORE:
+            continue
+        if is_in_cooldown(alert_log, base, RANK_A3):
             continue
         group_a.append({"base": base, "a": a})
 
-    group_c.sort(key=lambda x: x["b"]["score"], reverse=True)
-    group_b.sort(key=lambda x: x["b"]["score"], reverse=True)
-    group_a.sort(key=lambda x: x["a"]["rvol"], reverse=True)
+    vol = lambda g: g["b"]["detail"]["volX1"]["value"]
+    group_c.sort(key=vol, reverse=True)
+    group_b.sort(key=vol, reverse=True)
+    group_a.sort(key=lambda g: g["a"]["rvol"], reverse=True)
 
-    return group_c, group_b, group_a
+    return group_c, group_b, group_a[:A_TOP_N]
 
 
 def record_alerts(alert_log, group_c, group_b, group_a):
     now = datetime.now(timezone.utc).isoformat()
-    for g in group_c + group_b:
-        alert_log[g["base"]] = {"ts": now, "score": g["b"]["score"]}
+    for g in group_c:
+        alert_log[g["base"]] = {"ts": now, "score": RANK_FIRE}
+    for g in group_b:
+        alert_log[g["base"]] = {"ts": now, "score": RANK_B6}
     for g in group_a:
-        alert_log[g["base"]] = {"ts": now, "score": None}
+        alert_log[g["base"]] = {"ts": now, "score": RANK_A3}
 
 
 # ==================== 메시지 ====================
@@ -714,32 +744,40 @@ def fmt_a_line(a):
     )
 
 
+MESSAGE_FOOTER = (
+    "━━━━━━━━━━━━━━\n\n"
+    "세력 탐지기는 알트코인을 24시간, 1시간 단위로 지켜보다가\n"
+    "평소와 다른 움직임이 포착된 종목만 골라 알려드립니다.\n\n"
+    "✔ 거래량이 평소 대비 유의미하게 늘었는지\n"
+    "✔ 가격이 이평선 위로 올라섰는지 (이격도)\n"
+    "✔ 캔들 흐름이 상승으로 이어지는지\n\n"
+    "이 외에도 여러 필터링 조건을 통과한 종목만 올라옵니다.\n\n"
+    "※ 차트를 볼 후보 목록입니다. 매수 신호가 아니니 진입은 꼭 직접 판단하세요."
+)
+
+
 def build_message(group_c, group_b, group_a, a_enabled, a_ready):
+    """
+    🚨 세력 탐지기 | 09-22 13:41
+
+    🔥 AVNT      ← B 6점 + A 통과
+    🐋 COOKIE    ← B 6점
+    🐋 OPG       ← A 3점
+
+    ━━━━━━━━━━━━━━
+    (설명 문구)
+    """
     now_kst = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime("%m-%d %H:%M")
     total = len(group_c) + len(group_b) + len(group_a)
 
-    lines = [f"📊 <b>알트 스크리너</b> ({now_kst} KST)\n"]
+    lines = [f"🚨 <b>세력 탐지기</b> | {now_kst}", ""]
 
-    if group_c:
-        lines.append(f"🔴 <b>C · 양쪽 충족</b> {len(group_c)}")
-        for g in group_c:
-            a = g["a"]
-            lines.append(
-                fmt_b_line(g["b"]) + f" · RVOL{a['rvol']:.1f}"
-            )
-        lines.append("")
-
-    if group_b:
-        lines.append(f"🎯 <b>B · 진입 후보</b> {len(group_b)}")
-        for g in group_b:
-            lines.append(fmt_b_line(g["b"]))
-        lines.append("")
-
-    if group_a:
-        lines.append(f"🚨 <b>A · 거래량 급등</b> {len(group_a)}")
-        for g in group_a:
-            lines.append(fmt_a_line(g["a"]))
-        lines.append("")
+    for g in group_c:
+        lines.append(f"🔥 <b>{g['base']}</b>")
+    for g in group_b:
+        lines.append(f"🐋 <b>{g['base']}</b>")
+    for g in group_a:
+        lines.append(f"🐋 <b>{g['base']}</b>")
 
     if total == 0:
         lines.append("조건에 맞는 신규 종목이 없습니다.")
@@ -747,13 +785,11 @@ def build_message(group_c, group_b, group_a, a_enabled, a_ready):
     # A는 스냅샷이 일정 개수 쌓여야 판단을 시작한다. 그전까지는 안내를 띄운다.
     if a_enabled and a_ready < A_MIN_HISTORY_SNAPSHOTS:
         remaining = A_MIN_HISTORY_SNAPSHOTS - a_ready
-        lines.append(f"<i>ℹ️ A 준비중 · 스냅샷 {a_ready}/{A_MIN_HISTORY_SNAPSHOTS} "
+        lines.append(f"<i>ℹ️ 거래량 데이터 준비중 · {a_ready}/{A_MIN_HISTORY_SNAPSHOTS} "
                      f"(약 {remaining}시간 뒤 작동)</i>")
 
-    lines.append(
-        "<i>V=1H거래량배율 · MA=MA20이격 · 🔥=거래량 3배↑\n"
-        f"{ALERT_COOLDOWN_HOURS}시간 내 중복 알림 없음 · 매수 신호 아님</i>"
-    )
+    lines.append("")
+    lines.append(MESSAGE_FOOTER)
     return "\n".join(lines)
 
 
@@ -894,37 +930,51 @@ def self_test():
     finally:
         ALERT_LOG_PATH = orig_path
 
-    # --- 테스트 7: A/B/C 병합 ---
-    print("\n테스트7: A/B/C 병합")
+    # --- 테스트 7: 🔥/🐋 병합 규칙 ---
+    print("\n테스트7: 병합 규칙 (B 6점만 · 양쪽 충족 🔥 · A는 3점만)")
+    def fake_a(sym, rvol, turnover):
+        return {"symbol": sym, "name": sym, "spot_vol": 5e7, "deriv_vol": 2e7,
+                "total_vol": 7e7, "rvol": rvol, "turnover": turnover,
+                "a_score": a_score(rvol, turnover), "check_label": "✅ 검증됨"}
     a_list = [
-        {"symbol": "ACT", "name": "Act", "spot_vol": 5e7, "deriv_vol": 2e7,
-         "total_vol": 7e7, "rvol": 3.1, "turnover": 0.45, "check_label": "✅ 검증됨"},
-        {"symbol": "ONLYA", "name": "OnlyA", "spot_vol": 5e7, "deriv_vol": 0,
-         "total_vol": 5e7, "rvol": 2.5, "turnover": 0.35, "check_label": "✅ 검증됨"},
+        fake_a("ACT", 3.1, 0.45),     # A 1점 + B 6점 → 🔥
+        fake_a("ATHREE", 6.0, 1.50),  # A 3점 단독 → 🐋
+        fake_a("ATWO", 6.0, 0.50),    # A 2점 단독 → 제외
     ]
-    b_list = [
-        {"symbol": "ACTUSDT", "price": 0.0118, "qv24h": 1.8e7, "score": 6,
-         "tag": "강신호", "detail": detail},
-        {"symbol": "ONLYBUSDT", "price": 0.05, "qv24h": 5e6, "score": 4,
-         "tag": None, "detail": detail},
-    ]
+    def fake_b(sym, score):
+        return {"symbol": sym, "price": 0.05, "qv24h": 5e6, "score": score,
+                "tag": None, "detail": detail}
+    b_list = [fake_b("ACTUSDT", 6), fake_b("BSIXUSDT", 6), fake_b("BFIVEUSDT", 5)]
+
+    print(f"   A 점수: ACT={a_score(3.1,0.45)} ATHREE={a_score(6,1.5)} ATWO={a_score(6,0.5)} "
+          "(1, 3, 2 기대)")
     gc, gb, ga = merge_results(a_list, b_list, {})
-    print(f"   C(교집합): {[g['base'] for g in gc]} (['ACT'] 기대)")
-    print(f"   B단독: {[g['base'] for g in gb]} (['ONLYB'] 기대)")
-    print(f"   A단독: {[g['base'] for g in ga]} (['ONLYA'] 기대)")
-    ok7 = ([g["base"] for g in gc] == ["ACT"]
-           and [g["base"] for g in gb] == ["ONLYB"]
-           and [g["base"] for g in ga] == ["ONLYA"])
-    if not ok7:
-        failures.append("테스트7: 병합 결과 불일치")
+    got = ([g['base'] for g in gc], [g['base'] for g in gb], [g['base'] for g in ga])
+    print(f"   🔥 {got[0]} (['ACT'] 기대) / 🐋B6 {got[1]} (['BSIX'] 기대) / "
+          f"🐋A3 {got[2]} (['ATHREE'] 기대)")
+    ok7 = got == (["ACT"], ["BSIX"], ["ATHREE"])
+
+    # 쿨다운: 12시간 안이라도 🐋(6) → 🔥(7) 승급이면 다시 알림, 같은 등급이면 차단
+    log = {"ACT": {"ts": now, "score": RANK_B6}, "BSIX": {"ts": now, "score": RANK_B6}}
+    gc2, gb2, _ = merge_results(a_list, b_list, log)
+    ok7b = [g["base"] for g in gc2] == ["ACT"] and gb2 == []
+    print(f"   쿨다운: 승급 재알림 {[g['base'] for g in gc2]} / 같은 등급 차단 {gb2}")
+    if not (ok7 and ok7b):
+        failures.append(f"테스트7: 병합 결과 불일치 {got}")
     else:
         print("✅ 테스트7 통과")
 
     # --- 테스트 8: 메시지 생성 ---
     print("\n테스트8: 메시지 생성")
     msg = build_message(gc, gb, ga, True, 20)
-    assert "C · 양쪽 충족" in msg and "B · 진입 후보" in msg and "A · 거래량 급등" in msg
-    print("✅ 테스트8 통과\n")
+    order = [msg.find("🔥 <b>ACT</b>"), msg.find("🐋 <b>BSIX</b>"), msg.find("🐋 <b>ATHREE</b>")]
+    ok8 = ("🚨 <b>세력 탐지기</b> | " in msg and all(i > 0 for i in order)
+           and order == sorted(order) and "BFIVE" not in msg and "ATWO" not in msg
+           and "매수 신호가 아니니" in msg)
+    if not ok8:
+        failures.append("테스트8: 메시지 형식 오류")
+    else:
+        print("✅ 테스트8 통과\n")
     print("--- 메시지 미리보기 ---")
     print(msg)
     print("--- 미리보기 끝 ---\n")
