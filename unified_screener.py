@@ -117,6 +117,28 @@ A_STRONG_RVOL = 5.0                   # +1점: 평소 대비 5배 이상 (거래
 A_STRONG_TURNOVER = 1.0               # +1점: 회전율 100% 이상 (시총만큼 손바뀜)
 A_SHOW_MIN_SCORE = 3                  # A 단독은 3점(최고점)만 알림
 
+
+# ==================== 강도 막대 설정 ====================
+# 종목 옆에 붙는 5칸 막대. "거래량이 평소의 몇 배로 튀었나"를 눈에 보이게 한 것이고,
+# 수익 가능성 순서가 아니다. (명세서 기준 점수와 수익률 상관계수는 -0.50)
+#
+#   B 종목은 1시간 거래대금 배율(V), A 단독 종목은 RVOL을 기준으로 칸을 채운다.
+#   A에도 걸린 종목(🔥)은 한 칸을 더 준다. 최소 3칸, 최대 5칸.
+#     3배 미만 ▰▰▰▱▱ / 3~10배 ▰▰▰▰▱ / 10배 이상 ▰▰▰▰▰
+BAR_FILLED = "▰"
+BAR_EMPTY = "▱"
+BAR_LEVELS = [3.0, 10.0]              # 이 값을 넘을 때마다 한 칸씩 늘어난다
+BAR_MIN = 3                           # 최소 3칸부터 시작
+BAR_MAX = 5                           # 최대 5칸
+SHOW_VOL_MULTIPLE = False             # True로 두면 막대 옆에 "11.7배"를 함께 표시
+NAME_PAD = 10                         # 종목명을 이 길이로 맞춰 막대 시작점을 정렬한다
+
+# 종목명을 누르면 트레이딩뷰 1시간봉 차트로 이동시킨다.
+# 링크(<a>)와 고정폭(<code>)은 함께 쓸 수 없어서, 링크를 켜면 막대를 앞으로 보내
+# 줄을 맞춘다(막대는 항상 5칸이라 길이가 같다).
+LINK_TO_TRADINGVIEW = True
+TRADINGVIEW_URL = "https://www.tradingview.com/chart/?symbol=BINANCE%3A{symbol}&interval=60"
+
 CROSS_CHECK_DISCREPANCY_THRESHOLD = 0.30  # 코인게코 vs CMC 오차 허용치
 
 EXCLUDE_IDS = {"bitcoin", "ethereum"}
@@ -712,6 +734,28 @@ def record_alerts(alert_log, group_c, group_b, group_a):
 
 # ==================== 메시지 ====================
 
+def strength_bar(multiple, bonus=False):
+    """거래량 배율을 5칸 막대로. bonus=True면 한 칸 더(🔥 종목)."""
+    level = BAR_MIN + sum(1 for th in BAR_LEVELS if multiple >= th) + (1 if bonus else 0)
+    level = max(BAR_MIN, min(BAR_MAX, level))
+    return BAR_FILLED * level + BAR_EMPTY * (BAR_MAX - level)
+
+
+def ticker_line(emoji, base, multiple, bonus=False, symbol=None):
+    """
+    한 줄을 만든다.
+      링크 켬: '🔥 🟩🟩🟩🟩🟩 NIL'   (종목명을 누르면 트레이딩뷰 1시간봉)
+      링크 끔: '🔥 NIL       🟩🟩🟩🟩🟩'
+    """
+    bar = strength_bar(multiple, bonus)
+    tail = f"  {multiple:.1f}배" if SHOW_VOL_MULTIPLE else ""
+    if LINK_TO_TRADINGVIEW:
+        url = TRADINGVIEW_URL.format(symbol=symbol or f"{base}USDT")
+        return f'{emoji} {bar} <a href="{url}"><b>{base}</b></a>{tail}'
+    name = base.ljust(max(NAME_PAD, len(base) + 1))
+    return f"{emoji} <code>{name}</code>{bar}{tail}"
+
+
 def short_symbol(sym):
     """'XPLUSDT' -> 'XPL'. 한 줄 표시에서 USDT 접미사는 군더더기라 뗀다."""
     return sym[:-4] if sym.endswith("USDT") else sym
@@ -744,6 +788,11 @@ def fmt_a_line(a):
     )
 
 
+def volx(b):
+    """B 결과에서 1시간 거래대금 배율을 꺼낸다."""
+    return b["detail"]["volX1"]["value"]
+
+
 MESSAGE_FOOTER = (
     "━━━━━━━━━━━━━━\n\n"
     "세력 탐지기는 알트코인을 24시간, 1시간 단위로 지켜보다가\n"
@@ -773,11 +822,14 @@ def build_message(group_c, group_b, group_a, a_enabled, a_ready):
     lines = [f"🚨 <b>세력 탐지기</b> | {now_kst}", ""]
 
     for g in group_c:
-        lines.append(f"🔥 <b>{g['base']}</b>")
+        lines.append(ticker_line("🔥", g["base"], volx(g["b"]), bonus=True,
+                                 symbol=g["b"]["symbol"]))
     for g in group_b:
-        lines.append(f"🐋 <b>{g['base']}</b>")
+        lines.append(ticker_line("🐋", g["base"], volx(g["b"]),
+                                 symbol=g["b"]["symbol"]))
     for g in group_a:
-        lines.append(f"🐋 <b>{g['base']}</b>")
+        # A 단독은 바이낸스 심볼을 모르므로 'BASE + USDT'로 추정한다.
+        lines.append(ticker_line("🐋", g["base"], g["a"]["rvol"]))
 
     if total == 0:
         lines.append("조건에 맞는 신규 종목이 없습니다.")
@@ -798,7 +850,8 @@ def send_telegram(message):
     chunks = [message[i:i + 3800] for i in range(0, len(message), 3800)] or [message]
     for chunk in chunks:
         resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk,
-                                        "parse_mode": "HTML"}, timeout=15)
+                                        "parse_mode": "HTML",
+                                        "disable_web_page_preview": "true"}, timeout=15)
         resp.raise_for_status()
         time.sleep(0.5)
 
@@ -967,10 +1020,12 @@ def self_test():
     # --- 테스트 8: 메시지 생성 ---
     print("\n테스트8: 메시지 생성")
     msg = build_message(gc, gb, ga, True, 20)
-    order = [msg.find("🔥 <b>ACT</b>"), msg.find("🐋 <b>BSIX</b>"), msg.find("🐋 <b>ATHREE</b>")]
+    order = [msg.find(">ACT<"), msg.find(">BSIX<"), msg.find(">ATHREE<")]
     ok8 = ("🚨 <b>세력 탐지기</b> | " in msg and all(i > 0 for i in order)
            and order == sorted(order) and "BFIVE" not in msg and "ATWO" not in msg
-           and "매수 신호가 아니니" in msg)
+           and "매수 신호가 아니니" in msg
+           and msg.count(BAR_FILLED) >= 3 and BAR_EMPTY in msg
+           and "tradingview.com/chart/?symbol=BINANCE%3AACTUSDT&interval=60" in msg)
     if not ok8:
         failures.append("테스트8: 메시지 형식 오류")
     else:
