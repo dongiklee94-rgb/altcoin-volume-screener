@@ -6,11 +6,11 @@
 7개 이평선이 완전한 역배열로 정렬된 알트코인을 찾아 텔레그램으로 알린다.
 
   사용 이평선 : 20 · 60 · 112 · 224 · 448 · 896 · 1792 (전부 5분봉 단순이동평균)
-  이탈        : 종가가 1792선 위 -> 아래로 내려온 봉
+  이탈        : 종가가 1792선 아래에 있을 것
   역배열 완성 : MA20 < MA60 < MA112 < MA224 < MA448 < MA896 < MA1792
                 (직전 봉에서는 성립하지 않았는데 이번 봉에서 처음 성립한 시점)
-  신호 조건   : 역배열이 '처음 완성된 봉'이 최근 RECENT_BARS 안에 있고,
-                그 봉으로부터 288봉 이내에 1792선 이탈이 있었으며,
+  신호 조건   : 역배열이 '처음 완성된 봉'이 최근 RECENT_BARS(12시간) 안에 있고,
+                그 시점의 종가가 1792선 아래였으며,
                 지금도 역배열이 유지되고 있을 것
 
 ⚠️ 이 알림의 성격
@@ -81,12 +81,20 @@ MA_PERIODS = [20, 60, 112, 224, 448, 896, 1792]
 MA_LONGEST = MA_PERIODS[-1]
 
 INTERVAL = "5m"
-BREAKDOWN_LOOKBACK_BARS = 288    # 1792선 이탈 후 역배열까지 허용하는 봉 수 (288봉 = 24시간)
-RECENT_BARS = 36                 # 역배열이 '최근 이만큼 안에' 완성됐을 때만 알린다 (36봉 = 3시간)
+RECENT_BARS = 144                # 역배열이 '최근 이만큼 안에' 완성됐을 때만 알린다 (144봉 = 12시간)
 REQUIRE_STILL_ALIGNED = True     # 지금도 역배열이 유지 중일 것
 
-# 캔들을 몇 개나 받아올지. MA1792 + 이탈탐색 288 + 최근 36 + 여유
-NEED_CLOSED_BARS = MA_LONGEST + BREAKDOWN_LOOKBACK_BARS + RECENT_BARS + 60   # 2176
+# 1792선 이탈 조건
+#   언제 깨고 내려왔는지(교차 시점)는 따지지 않는다. 역배열이 완성된 시점에
+#   종가가 1792선 아래에 있기만 하면 통과한다.
+#
+#   처음에는 '이탈 후 24시간 안에 역배열 완성'으로 만들었는데, 실제 데이터로 돌려보니
+#   전 종목이 걸러졌다. 하락장에서는 1792선을 깬 지 며칠 지난 뒤에야 역배열이
+#   완성되기 때문이다 (2026-10-26 기준 56종목 중 40종목이 이미 1792선 아래였다).
+REQUIRE_BELOW_MA_LONG = True
+
+# 캔들을 몇 개나 받아올지. MA1792 + 최근 144 + 여유
+NEED_CLOSED_BARS = MA_LONGEST + RECENT_BARS + 120   # 2056
 
 # 유니버스 (세력탐지기와 동일 기준)
 MAX_PRICE_USDT = 1.0
@@ -118,6 +126,10 @@ RETRY_BACKOFF_SEC = 2.0
 HTTP_TIMEOUT = 20
 
 BINANCE_API = "https://data-api.binance.vision/api/v3"
+
+# 현물 klines는 한 번에 최대 1000개만 준다. 1500을 요청해도 조용히 1000개만 돌려주므로
+# 이 값을 넘겨 요청하면 "더 이상 과거가 없다"고 잘못 판단하게 된다. (선물은 1500)
+MAX_KLINES_PER_CALL = 1000
 
 STATE_DIR = os.environ.get(
     "SCREENER_STATE_DIR",
@@ -237,8 +249,8 @@ def fetch_closed_closes(symbol, need):
     end_time = None
     remaining = need + 1          # 진행 중인 봉 1개를 버릴 몫
     while remaining > 0:
-        params = {"symbol": symbol, "interval": INTERVAL,
-                  "limit": min(1500, remaining)}
+        want = min(MAX_KLINES_PER_CALL, remaining)
+        params = {"symbol": symbol, "interval": INTERVAL, "limit": want}
         if end_time is not None:
             params["endTime"] = end_time
         raw = binance_get("/klines", params)
@@ -247,7 +259,7 @@ def fetch_closed_closes(symbol, need):
         chunks.append(raw)
         remaining -= len(raw)
         end_time = raw[0][0] - 1   # 다음 호출은 이 묶음보다 더 과거
-        if len(raw) < params["limit"]:
+        if len(raw) < want:
             break                  # 상장 초기라 더 이상 과거가 없다
 
     bars = []
@@ -293,7 +305,7 @@ def find_signal(closes):
 
     1) 역배열이 '처음 완성된' 가장 최근 봉 j를 찾는다 (j-1은 역배열이 아니어야 한다)
     2) j가 최근 RECENT_BARS 안에 있어야 한다
-    3) j에서 BREAKDOWN_LOOKBACK_BARS 이내 과거에 1792선 이탈이 있어야 한다
+    3) j 시점의 종가가 1792선 아래여야 한다
     4) REQUIRE_STILL_ALIGNED면 마지막 봉도 역배열이어야 한다
     """
     n = len(closes)
@@ -316,17 +328,20 @@ def find_signal(closes):
     if completed_at is None:
         return None
 
-    # 3) 이탈 시점 찾기: 종가가 1792선 위 -> 아래로 내려온 봉
+    # 3) 역배열이 완성된 시점에 종가가 1792선 아래였는지
+    if REQUIRE_BELOW_MA_LONG:
+        ref = ma_long[completed_at]
+        if ref is None or closes[completed_at] >= ref:
+            return None
+
+    # 참고용: 1792선을 마지막으로 깨고 내려온 시점 (찾지 못하면 None)
     broke_at = None
-    start = max(MA_LONGEST, completed_at - BREAKDOWN_LOOKBACK_BARS)
-    for i in range(completed_at, start - 1, -1):
+    for i in range(completed_at, MA_LONGEST, -1):
         if ma_long[i] is None or ma_long[i - 1] is None:
             continue
         if closes[i] < ma_long[i] and closes[i - 1] >= ma_long[i - 1]:
             broke_at = i
             break
-    if broke_at is None:
-        return None
 
     price = closes[last]
     gap = (price / ma_long[last] - 1) * 100 if ma_long[last] else 0.0
@@ -334,9 +349,9 @@ def find_signal(closes):
         "price": price,
         "ma1792": ma_long[last],
         "gap_pct": gap,                                   # 음수 = 1792선 아래
-        "bars_since_break": last - broke_at,
+        "bars_since_break": None if broke_at is None else last - broke_at,
         "bars_since_align": last - completed_at,
-        "bars_break_to_align": completed_at - broke_at,
+        "bars_break_to_align": None if broke_at is None else completed_at - broke_at,
     }
 
 
@@ -407,8 +422,8 @@ MESSAGE_FOOTER = (
     "━━━━━━━━━━━━━━\n\n"
     "역배열 탐지기는 5분봉 차트를 자동으로 살펴보다가\n"
     "상승 흐름이 하락으로 완전히 돌아선 종목을 골라 알려드립니다.\n\n"
-    "✔ 1792 이평선을 아래로 이탈했는지\n"
-    "✔ 그 뒤 24시간 안에 흐름이 무너졌는지\n"
+    "✔ 가격이 1792 이평선 아래에 있는지\n"
+    "✔ 최근 12시간 안에 흐름이 무너졌는지\n"
     "✔ 7개 이평선(20·60·112·224·448·896·1792)이\n"
     "   완전한 역배열로 정렬됐는지\n\n"
     "막대는 1792선 아래로 얼마나 벌어졌는지를 나타냅니다.\n\n"
@@ -512,8 +527,8 @@ def self_test():
         failures.append("테스트4: 역배열이 막 완성됐는데 신호가 안 나옴")
     elif hit["gap_pct"] >= 0:
         failures.append("테스트4: 1792선 위인데 신호가 남")
-    elif hit["bars_break_to_align"] > BREAKDOWN_LOOKBACK_BARS:
-        failures.append("테스트4: 이탈→역배열 간격이 허용치를 넘음")
+    elif hit["price"] >= hit["ma1792"]:
+        failures.append("테스트4: 1792선 위인데 신호가 남")
     else:
         print("✅ 테스트4 통과\n")
 
@@ -536,14 +551,19 @@ def self_test():
     else:
         print("✅ 테스트6 통과\n")
 
-    # --- 테스트 6b: 이탈 후 24시간(288봉)을 넘겨 완성된 경우 -> 신호 없음 ---
-    # 아주 천천히 흘러내리면 이탈과 역배열 사이가 288봉을 넘는다.
-    c6b = falling_series(slope=0.25, extra_bars=5)
+    # --- 테스트 6b: 역배열이지만 가격이 1792선 위 -> 신호 없음 ---
+    # 길게 눌렸다가 막 반등해서 1792선을 되돌린 모양. 이평선은 아직 역배열이지만
+    # 가격은 1792선 위에 있으므로 걸러져야 한다.
+    c6b = falling_series(slope=1.0, extra_bars=0)
+    if c6b:
+        mas6b = [sma_series(c6b, p) for p in MA_PERIODS]
+        ref = mas6b[-1][-1]
+        c6b = c6b[:-1] + [ref * 1.05]      # 마지막 봉만 1792선 위로 올려놓는다
     r6b = find_signal(c6b) if c6b else None
-    print(f"테스트6b: 이탈→역배열 {BREAKDOWN_LOOKBACK_BARS}봉 초과 -> "
+    print(f"테스트6b: 역배열이지만 가격이 1792선 위 -> "
           f"{'신호 발생' if r6b else '신호 없음'} (신호 없음 기대)")
     if r6b:
-        failures.append("테스트6b: 이탈→역배열 간격이 허용치를 넘었는데 신호가 남")
+        failures.append("테스트6b: 1792선 위인데 신호가 남")
     else:
         print("✅ 테스트6b 통과\n")
 
