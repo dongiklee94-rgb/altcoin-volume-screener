@@ -1,0 +1,55 @@
+
+name: Reversal Screener
+
+on:
+  schedule:
+    # 10분마다. GitHub 무료 크론은 부하에 따라 밀릴 수 있으므로,
+    # 제때 돌리려면 외부 스케줄러(cron-job.org 등)로 workflow_dispatch를 호출한다.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: reversal-screener
+  cancel-in-progress: false
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Self test
+        run: python reversal_screener.py --self-test
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: reversal-state
+          key: reversal-state-${{ github.run_id }}
+          restore-keys: |
+            reversal-state-
+
+      - name: Run screener
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID_REVERSAL: ${{ secrets.TELEGRAM_CHAT_ID_REVERSAL }}
+          SCREENER_STATE_DIR: reversal-state
+        run: python reversal_screener.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: reversal-state
+          key: reversal-state-${{ github.run_id }}
