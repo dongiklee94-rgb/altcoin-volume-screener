@@ -96,10 +96,13 @@ def load_dotenv_if_present():
 
 load_dotenv_if_present()
 
-COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
-COINMARKETCAP_API_KEY = os.environ.get("COINMARKETCAP_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# 값 앞뒤의 공백·줄바꿈을 반드시 제거한다.
+# GitHub Secrets에 토큰을 붙여넣을 때 엔터가 같이 들어가는 일이 흔한데,
+# 그대로 두면 요청 주소가 '.../bot<토큰>%0A/sendMessage'가 되어 404가 난다.
+COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "").strip()
+COINMARKETCAP_API_KEY = os.environ.get("COINMARKETCAP_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 
 # ==================== A: 코인게코 거래량 급등 설정 ====================

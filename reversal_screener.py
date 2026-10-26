@@ -70,8 +70,11 @@ def load_dotenv_if_present():
 
 load_dotenv_if_present()
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID_REVERSAL", "")
+# 값 앞뒤의 공백·줄바꿈을 반드시 제거한다.
+# GitHub Secrets에 토큰을 붙여넣을 때 엔터가 같이 들어가는 일이 흔한데,
+# 그대로 두면 요청 주소가 '.../bot<토큰>%0A/sendMessage'가 되어 404가 난다.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID_REVERSAL", "").strip()
 
 
 # ==================== 조건 설정 ====================
