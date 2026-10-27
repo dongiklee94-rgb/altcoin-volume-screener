@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-고래와개미팀 - 역배열 탐지기 (5분봉)
+고래와개미팀 - 저평가 종목알림 (5분봉 역배열 기반)
 
 5분봉에서 1792 이동평균선을 이탈한 뒤, 24시간(288봉) 안에
 7개 이평선이 완전한 역배열로 정렬된 알트코인을 찾아 텔레그램으로 알린다.
@@ -26,7 +26,7 @@
 
 --- 필요한 환경변수 ---
   TELEGRAM_BOT_TOKEN        (필수)
-  TELEGRAM_CHAT_ID_REVERSAL (필수) 역배열 탐지기 전용 채널 ID
+  TELEGRAM_CHAT_ID_REVERSAL (필수) 저평가 종목알림 전용 채널 ID
   SCREENER_STATE_DIR        (선택) 중복 알림 방지 기록 저장 폴더
 
 --- 실행 ---
@@ -110,11 +110,17 @@ STABLECOIN_SYMBOLS = {
 }
 
 # 강도 막대: 현재가가 1792선보다 얼마나 아래로 벌어졌는지(이격도 %)
+SHOW_STRENGTH_BAR = False        # True 로 바꾸면 종목명 앞에 강도 막대가 나온다
 BAR_FILLED = "▰"
 BAR_EMPTY = "▱"
 BAR_LEVELS = [5.0, 12.0]         # 이 값을 넘을 때마다 한 칸씩 늘어난다 (%)
 BAR_MIN = 3
 BAR_MAX = 5
+
+# 채널에 보이는 이름과 기호 (여기만 고치면 메시지 전체가 따라 바뀐다)
+CHANNEL_TITLE = "저평가 종목알림"
+TITLE_EMOJI = "🔎"
+TICKER_EMOJI = "🟢"
 
 LINK_TO_TRADINGVIEW = True
 TRADINGVIEW_URL = "https://www.tradingview.com/chart/?symbol=BINANCE%3A{symbol}&interval=5"
@@ -414,30 +420,27 @@ def short_symbol(sym):
 
 def ticker_line(hit):
     base = short_symbol(hit["symbol"])
-    bar = strength_bar(hit["gap_pct"])
+    # SHOW_STRENGTH_BAR 을 True 로 두면 종목명 앞에 강도 막대가 함께 표시된다.
+    bar = f"{strength_bar(hit['gap_pct'])} " if SHOW_STRENGTH_BAR else ""
     if LINK_TO_TRADINGVIEW:
         url = TRADINGVIEW_URL.format(symbol=hit["symbol"])
-        return f'🔻 {bar} <a href="{url}"><b>{base}</b></a>'
-    return f"🔻 {bar} <b>{base}</b>"
+        return f'{TICKER_EMOJI} {bar}<a href="{url}"><b>{base}</b></a>'
+    return f"{TICKER_EMOJI} {bar}<b>{base}</b>"
 
 
 MESSAGE_FOOTER = (
     "━━━━━━━━━━━━━━\n\n"
-    "역배열 탐지기는 5분봉 차트를 자동으로 살펴보다가\n"
-    "상승 흐름이 하락으로 완전히 돌아선 종목을 골라 알려드립니다.\n\n"
-    "✔ 가격이 1792 이평선 아래에 있는지\n"
-    "✔ 최근 12시간 안에 흐름이 무너졌는지\n"
-    "✔ 7개 이평선(20·60·112·224·448·896·1792)이\n"
-    "   완전한 역배열로 정렬됐는지\n\n"
-    "막대는 1792선 아래로 얼마나 벌어졌는지를 나타냅니다.\n\n"
-    "※ 매도·숏 신호가 아닙니다. 역배열 직후 급반등이 나오는 경우도 있으니\n"
-    "   진입은 꼭 직접 판단하세요."
+    "5분봉 기준으로 평소보다 깊게 눌린 종목 중,\n"
+    "하락 흐름이 상승으로 돌아설 가능성이 보이는 종목을 골라 알려드립니다.\n\n"
+    "단기 되돌림을 노리며 분할매수를 준비해볼 만한 구간입니다.\n\n"
+    "※ 매수 신호가 아닙니다. 눌림이 더 깊어질 수 있으니\n"
+    "   진입과 비중은 꼭 직접 판단하세요."
 )
 
 
 def build_message(hits):
     now_kst = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime("%m-%d %H:%M")
-    lines = [f"📉 <b>역배열 탐지기</b> | {now_kst}", ""]
+    lines = [f"{TITLE_EMOJI} <b>{CHANNEL_TITLE}</b> | {now_kst}", ""]
 
     for h in hits:
         lines.append(ticker_line(h))
@@ -612,8 +615,10 @@ def self_test():
         {"symbol": "QQQUSDT", "gap_pct": -17.1, "bars_since_align": 21},
     ]
     msg = build_message(sample)
-    ok10 = ("역배열 탐지기" in msg and "ABC" in msg and "매수" not in msg
-            and "interval=5" in msg and BAR_FILLED in msg)
+    ok10 = (CHANNEL_TITLE in msg and "ABC" in msg
+            and "매수 신호가 아닙니다" in msg      # 면책 문구가 빠지지 않았는지
+            and "interval=5" in msg
+            and (BAR_FILLED in msg) == SHOW_STRENGTH_BAR)
     if not ok10:
         failures.append("테스트10: 메시지 형식 오류")
     else:
